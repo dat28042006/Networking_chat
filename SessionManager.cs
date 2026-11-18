@@ -1,0 +1,188 @@
+﻿using System;
+using System.Collections.Concurrent;
+using System.Collections.Generic;
+using System.Linq;
+using System.Net;
+using System.Security.Cryptography;
+using System.Threading;
+using System.Threading.Tasks;
+
+namespace ChatApp.Server
+{
+    public sealed record UdpEndpoint(IPAddress Address, int Port, long LastSeenUtcMs)
+    {
+        public string Key => $"{Address}:{Port}";
+    }
+
+    public sealed record ResumeSession(long UserId, ulong UdpToken, long ExpiresAtUtcMs);
+
+    /// <summary>
+    /// Quản lý registry kết nối TCP đang hoạt động, cấp phát `udp_token`,
+    /// ánh xạ hai chiều `UserId <-> UdpEndpoint` và quản lý `resume_token` (hiệu lực 60s).
+    /// </summary>
+    public sealed class SessionManager : IDisposable
+    {
+        public static readonly TimeSpan ResumeTokenTtl = TimeSpan.FromSeconds(60);
+        public static readonly TimeSpan UdpEndpointTtl = TimeSpan.FromSeconds(15);
+
+        private readonly ConcurrentDictionary<long, ClientConnection> _userConnections = new();
+        private readonly ConcurrentDictionary<string, ResumeSession> _resumeTokens = new();
+
+        private readonly ConcurrentDictionary<ulong, long> _tokenToUser = new();
+        private readonly ConcurrentDictionary<long, ulong> _userToToken = new();
+        private readonly ConcurrentDictionary<long, UdpEndpoint> _userEndpoints = new();
+        private readonly ConcurrentDictionary<string, long> _endpointToUser = new();
+
+        private readonly CancellationTokenSource _cts = new();
+
+        public event Func<long, Task>? UserWentOffline;
+
+        public SessionManager()
+        {
+            _ = Task.Run(() => CleanupLoopAsync(_cts.Token));
+        }
+
+        // --- TCP Connection Registry ---
+
+        public void BindConnection(long userId, ClientConnection conn)
+        {
+            _userConnections[userId] = conn;
+        }
+
+        public async Task UnbindConnectionAsync(long userId, ClientConnection? expectedConn = null)
+        {
+            if (_userConnections.TryGetValue(userId, out var current))
+            {
+                if (expectedConn == null || ReferenceEquals(current, expectedConn))
+                {
+                    if (_userConnections.TryRemove(userId, out _))
+                    {
+                        RemoveUdpForUser(userId);
+                        if (UserWentOffline != null)
+                            await UserWentOffline.Invoke(userId).ConfigureAwait(false);
+                    }
+                }
+            }
+        }
+
+        public ClientConnection? ConnectionOf(long userId)
+            => _userConnections.TryGetValue(userId, out var conn) ? conn : null;
+
+        public bool IsOnline(long userId) => _userConnections.ContainsKey(userId);
+
+        public IReadOnlyCollection<long> OnlineUserIds => _userConnections.Keys.ToArray();
+
+        // --- Resume Token Management (60s TTL) ---
+
+        public string IssueResumeToken(long userId, ulong udpToken)
+        {
+            string token = Guid.NewGuid().ToString("N");
+            long expiresAt = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() + (long)ResumeTokenTtl.TotalMilliseconds;
+            _resumeTokens[token] = new ResumeSession(userId, udpToken, expiresAt);
+            return token;
+        }
+
+        public ResumeSession? ConsumeResumeToken(string token)
+        {
+            if (!_resumeTokens.TryRemove(token, out var session))
+                return null;
+
+            long now = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+            return now <= session.ExpiresAtUtcMs ? session : null;
+        }
+
+        // --- UDP Token & Endpoint Binding (Dùng chung với UdpServer) ---
+
+        public ulong IssueUdpToken(long userId)
+        {
+            if (_userToToken.TryRemove(userId, out ulong oldToken))
+                _tokenToUser.TryRemove(oldToken, out _);
+
+            ulong token;
+            Span<byte> buf = stackalloc byte[8];
+            do
+            {
+                RandomNumberGenerator.Fill(buf);
+                token = BitConverter.ToUInt64(buf);
+            } while (token == 0 || !_tokenToUser.TryAdd(token, userId));
+
+            _userToToken[userId] = token;
+            return token;
+        }
+
+        public bool BindUdpEndpoint(ulong token, IPAddress address, int port)
+        {
+            if (!_tokenToUser.TryGetValue(token, out long userId))
+                return false;
+
+            if (_userEndpoints.TryRemove(userId, out var prevEp))
+                _endpointToUser.TryRemove(prevEp.Key, out _);
+
+            long now = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+            var ep = new UdpEndpoint(address, port, now);
+            _userEndpoints[userId] = ep;
+            _endpointToUser[ep.Key] = userId;
+            return true;
+        }
+
+        public void TouchUdpEndpoint(IPAddress address, int port)
+        {
+            string key = $"{address}:{port}";
+            if (_endpointToUser.TryGetValue(key, out long userId) &&
+                _userEndpoints.TryGetValue(userId, out var ep))
+            {
+                long now = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+                _userEndpoints[userId] = ep with { LastSeenUtcMs = now };
+            }
+        }
+
+        public UdpEndpoint? UdpEndpointOf(long userId)
+            => _userEndpoints.TryGetValue(userId, out var ep) ? ep : null;
+
+        public long UserIdForEndpoint(IPAddress address, int port)
+            => _endpointToUser.TryGetValue($"{address}:{port}", out long uid) ? uid : 0;
+
+        private void RemoveUdpForUser(long userId)
+        {
+            if (_userToToken.TryRemove(userId, out ulong token))
+                _tokenToUser.TryRemove(token, out _);
+
+            if (_userEndpoints.TryRemove(userId, out var ep))
+                _endpointToUser.TryRemove(ep.Key, out _);
+        }
+
+        private async Task CleanupLoopAsync(CancellationToken ct)
+        {
+            using var timer = new PeriodicTimer(TimeSpan.FromSeconds(5));
+            try
+            {
+                while (await timer.WaitForNextTickAsync(ct).ConfigureAwait(false))
+                {
+                    long now = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+
+                    foreach (var kv in _resumeTokens)
+                    {
+                        if (now > kv.Value.ExpiresAtUtcMs)
+                            _resumeTokens.TryRemove(kv.Key, out _);
+                    }
+
+                    foreach (var kv in _userEndpoints)
+                    {
+                        if (now - kv.Value.LastSeenUtcMs > UdpEndpointTtl.TotalMilliseconds)
+                        {
+                            if (_userEndpoints.TryRemove(kv.Key, out var removed))
+                                _endpointToUser.TryRemove(removed.Key, out _);
+                        }
+                    }
+                }
+            }
+            catch (OperationCanceledException) { }
+        }
+
+        public void Dispose()
+        {
+            _cts.Cancel();
+            _cts.Dispose();
+        }
+    }
+}

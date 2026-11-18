@@ -1,0 +1,95 @@
+﻿using System;
+using System.Collections.Concurrent;
+using System.Text.Json.Nodes;
+using System.Threading.Tasks;
+
+namespace ChatApp.Server
+{
+    /// <summary>
+    /// Định tuyến request JSON nhận được theo trường `type` tới handler tương ứng.
+    /// Kiểm tra chuẩn envelope (`v == 1`, `type`, `id`) và quyền xác thực.
+    /// </summary>
+    public sealed class Dispatcher
+    {
+        public delegate Task<JsonObject> RequestHandler(ClientConnection conn, JsonObject data);
+
+        private readonly ConcurrentDictionary<string, (RequestHandler Handler, bool RequiresAuth)> _handlers = new();
+
+        public void RegisterHandler(string type, RequestHandler handler, bool requiresAuth = true)
+        {
+            _handlers[type] = (handler, requiresAuth);
+        }
+
+        public async Task DispatchAsync(ClientConnection conn, JsonObject frame)
+        {
+            int version = frame["v"]?.GetValue<int>() ?? 0;
+            string? type = frame["type"]?.GetValue<string>();
+            long reqId = frame["id"]?.GetValue<long>() ?? -1;
+
+            if (version != 1 || string.IsNullOrWhiteSpace(type) || reqId < 0)
+            {
+                await conn.SendAsync(MakeError(reqId, "BAD_REQUEST", "Invalid envelope: require v=1, type, id"))
+                          .ConfigureAwait(false);
+                return;
+            }
+
+            if (!_handlers.TryGetValue(type, out var entry))
+            {
+                await conn.SendAsync(MakeError(reqId, "NOT_FOUND", $"Unknown message type: {type}"))
+                          .ConfigureAwait(false);
+                return;
+            }
+
+            if (entry.RequiresAuth && !conn.IsAuthenticated)
+            {
+                await conn.SendAsync(MakeError(reqId, "UNAUTHORIZED", "Authentication required"))
+                          .ConfigureAwait(false);
+                return;
+            }
+
+            JsonObject data = frame["data"] as JsonObject ?? new JsonObject();
+            JsonObject result;
+            try
+            {
+                result = await entry.Handler(conn, data).ConfigureAwait(false);
+            }
+            catch (Exception ex)
+            {
+                result = MakeError(reqId, "INTERNAL", ex.Message);
+            }
+
+            result["v"] = 1;
+            result["re"] = reqId;
+            if (!result.ContainsKey("ok"))
+                result["ok"] = true;
+
+            await conn.SendAsync(result).ConfigureAwait(false);
+        }
+
+        public static JsonObject MakeSuccess(long reqId = 0, JsonObject? data = null)
+        {
+            return new JsonObject
+            {
+                ["v"] = 1,
+                ["re"] = reqId,
+                ["ok"] = true,
+                ["data"] = data ?? new JsonObject()
+            };
+        }
+
+        public static JsonObject MakeError(long reqId, string code, string message)
+        {
+            return new JsonObject
+            {
+                ["v"] = 1,
+                ["re"] = reqId,
+                ["ok"] = false,
+                ["error"] = new JsonObject
+                {
+                    ["code"] = code,
+                    ["message"] = message
+                }
+            };
+        }
+    }
+}
