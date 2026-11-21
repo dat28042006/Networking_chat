@@ -28,6 +28,14 @@ namespace ChatApp.Server
         private long _lastActivityUtcMs;
 
         public long UserId { get; set; }
+        public string Username { get; set; } = "";
+
+        /// <summary>True once the pending friend requests were pushed on this connection (see friend.list).</summary>
+        public bool PendingRequestsSent { get; set; }
+
+        /// <summary>Actions the Dispatcher runs right AFTER the reply to the current request was sent
+        /// (so an event never overtakes the reply it belongs to).</summary>
+        public ConcurrentQueue<Func<Task>> AfterReply { get; } = new();
         public bool IsAuthenticated => UserId > 0;
         public EndPoint? RemoteEndPoint => _client.Client.RemoteEndPoint;
 

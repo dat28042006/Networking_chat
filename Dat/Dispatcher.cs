@@ -53,9 +53,15 @@ namespace ChatApp.Server
             {
                 result = await entry.Handler(conn, data).ConfigureAwait(false);
             }
+            catch (ApiException ex)
+            {
+                result = MakeError(reqId, ex.Code, ex.Message);
+            }
             catch (Exception ex)
             {
-                result = MakeError(reqId, "INTERNAL", ex.Message);
+                // Details stay in the server log; the client only gets a generic message.
+                Console.WriteLine($"[Dispatcher] {type} failed: {ex}");
+                result = MakeError(reqId, "INTERNAL", "Internal server error");
             }
 
             result["v"] = 1;
@@ -64,6 +70,12 @@ namespace ChatApp.Server
                 result["ok"] = true;
 
             await conn.SendAsync(result).ConfigureAwait(false);
+
+            while (conn.AfterReply.TryDequeue(out var after))
+            {
+                try { await after().ConfigureAwait(false); }
+                catch (Exception ex) { Console.WriteLine($"[Dispatcher] after-reply of {type} failed: {ex.Message}"); }
+            }
         }
 
         public static JsonObject MakeSuccess(long reqId = 0, JsonObject? data = null)

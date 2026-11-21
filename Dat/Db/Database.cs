@@ -2,7 +2,7 @@ using Npgsql;
 
 namespace ChatApp.Server.Db;
 
-public sealed class Database : IAsyncDisposable
+public sealed partial class Database : IAsyncDisposable
 {
     private readonly NpgsqlDataSource _db;
 
